@@ -97,6 +97,8 @@ details summary{cursor:pointer;color:var(--accent);font-size:13px;font-weight:60
     <div class="filters" style="margin-top:14px">
       <div id="lanes" class="filters" role="group" aria-label="Lane"></div>
       <div id="fits" class="filters" role="group" aria-label="Fit"></div>
+      <button class="chip" id="floor" aria-pressed="true">$95K+ only</button>
+      <button class="chip" id="unlisted" aria-pressed="true">Include pay not listed</button>
       <button class="chip" id="tx" aria-pressed="false">Texas only</button>
       <select id="sort" aria-label="Sort"><option value="fit">Best fit</option><option value="pay">Highest pay</option><option value="new">Newest</option></select>
       <input type="search" id="q" placeholder="Search company, title, skill…" aria-label="Search">
@@ -122,6 +124,7 @@ const safe = (u) => /^https:\/\//.test(u || "") ? u : null;
 
 let postings = new Map(), apps = new Map(), lastRun = null, fresh = new Set();
 let stage = "New", lane = "All", fit = "All", tx = false, q = "", limit = 60, sortBy = "fit";
+let payFloor = 95000, showUnlisted = true; // only roles that can pay $95K+/yr
 
 function statusOf(p) { return apps.get(p.id)?.status || "New"; }
 function ago(d) { if (!d) return ""; const h = (Date.now() - new Date(d)) / 36e5; return h < 1 ? "just now" : h < 24 ? `${Math.round(h)}h ago` : `${Math.round(h/24)}d ago`; }
@@ -135,6 +138,7 @@ function visible() {
     if (lane !== "All" && p.lane !== lane) return false;
     if (fit !== "All" && p.fit !== fit) return false;
     if (tx && !/\b(TX|Texas)\b/.test(p.location || "")) return false;
+    if (payFloor && stage === "New") { if (p.pay_max_yr == null) { if (!showUnlisted) return false; } else if (p.pay_max_yr < payFloor) return false; }
     if (q) { const hay = `${p.company} ${p.title} ${p.location} ${(p.matched||[]).join(" ")}`.toLowerCase(); if (!hay.includes(q)) return false; }
     return true;
   }).sort((a, b) => sortBy === "pay" ? payValue(b) - payValue(a) || (b.score ?? 0) - (a.score ?? 0)
@@ -143,6 +147,7 @@ function visible() {
 }
 // Yearly value of the low end of the range, so hourly and salaried jobs sort together (hourly x 2080 hrs).
 function payValue(p) {
+  if (p.pay_max_yr != null) return p.pay_max_yr;
   const m = (p.pay || "").match(/\$([\d,.]+)\s*(K)?/i); if (!m) return -1;
   let n = parseFloat(m[1].replace(/,/g, "")) * (m[2] ? 1000 : 1);
   if (/\/hr|hour/i.test(p.pay) || n < 250) n *= 2080;
@@ -160,14 +165,15 @@ function grouped(list) {
 
 function render() {
   const all = [...postings.values()];
-  const counts = Object.fromEntries(STAGES.map((s) => [s, grouped(all.filter((p) => statusOf(p) === s && (s !== "New" || p.is_open))).length]));
+  const floorOk = (p) => !payFloor || (p.pay_max_yr == null ? showUnlisted : p.pay_max_yr >= payFloor);
+  const counts = Object.fromEntries(STAGES.map((s) => [s, grouped(all.filter((p) => statusOf(p) === s && (s !== "New" || (p.is_open && floorOk(p))))).length]));
   counts.Closed = grouped(all.filter((p) => !p.is_open || statusOf(p) === "Closed")).length;
   $("#pipe").innerHTML = [...STAGES, "Closed"].map((s) =>
     `<button class="stage" data-stage="${s}" aria-pressed="${s === stage}"><b>${counts[s]}</b><span>${s === "New" ? "New matches" : s}</span></button>`).join("");
   const lanes = ["All", ...new Set(all.map((p) => p.lane).filter(Boolean))];
   $("#lanes").innerHTML = lanes.map((l) => `<button class="chip" data-lane="${esc(l)}" aria-pressed="${l === lane}">${esc(l)}</button>`).join("");
   $("#fits").innerHTML = ["All","Strong","Good","Stretch"].map((f) => `<button class="chip" data-fit="${f}" aria-pressed="${f === fit}">${f === "All" ? "Any fit" : f}</button>`).join("");
-  $("#tx").setAttribute("aria-pressed", tx);
+  $("#tx").setAttribute("aria-pressed", tx); $("#floor").setAttribute("aria-pressed", !!payFloor); $("#unlisted").setAttribute("aria-pressed", showUnlisted); $("#unlisted").hidden = !payFloor;
 
   const rows = grouped(visible());
   $("#summary").textContent = `${rows.length} ${rows.length === 1 ? "job" : "jobs"} · sorted by ${{ fit: "fit score", pay: "highest pay", new: "newest" }[sortBy]}`;
@@ -189,7 +195,7 @@ function card(p) {
       <div class="badges">${isNew ? `<span class="tag new">New</span>` : ""}${p.is_open ? "" : `<span class="tag cl">Closed</span>`}
         ${p.fit ? `<span class="tag ${p.fit}">${p.fit} · ${p.score ?? "–"}</span>` : ""}</div>
     </div>
-    <div class="pay ${p.pay ? "" : "none"}">${p.pay ? esc(p.pay) : "Pay not listed"}</div>
+    <div class="pay ${p.pay ? "" : "none"}">${p.pay ? esc(p.pay) : "Pay not listed"}${p.pay_min_yr >= 95000 ? " · starts above $95K" : p.pay_max_yr >= 95000 ? " · can reach $95K+" : ""}</div>
     <div class="meta"><span>${esc(p.location || "")}</span><span>${esc(p.lane || "")}</span>
       ${p._dupes > 1 ? `<span>${p._dupes} openings</span>` : ""}<span>found ${ago(p.first_seen_at)}</span>${p.last_checked_at ? `<span>checked ${ago(p.last_checked_at)}</span>` : ""}</div>
     ${!p.is_open ? `<div class="reason">${esc(p.close_reason || "No longer listed")} · ${ago(p.closed_at)}</div>` : ""}
@@ -221,6 +227,8 @@ document.addEventListener("click", (e) => {
   else if (t.dataset.lane) { lane = t.dataset.lane; render(); }
   else if (t.dataset.fit) { fit = t.dataset.fit; render(); }
   else if (t.id === "tx") { tx = !tx; render(); }
+  else if (t.id === "floor") { payFloor = payFloor ? 0 : 95000; render(); }
+  else if (t.id === "unlisted") { showUnlisted = !showUnlisted; render(); }
   else if (t.id === "more") { limit += 60; render(); }
   else if (t.dataset.set) t.closest(".job").dataset.ids.split(",").forEach((id) => setStatus(id, t.dataset.set));
 });
@@ -243,7 +251,7 @@ function showLive() {
 
 async function loadAll() {
   const [{ data: ps, error: e1 }, { data: as }, { data: rs }] = await Promise.all([
-    sb.from("postings").select("id,company,title,location,url,lane,pay,description,first_seen_at,last_checked_at,is_open,closed_at,close_reason,score,fit,matched,gaps,why")
+    sb.from("postings").select("id,company,title,location,url,lane,pay,description,first_seen_at,last_checked_at,is_open,closed_at,close_reason,score,fit,matched,gaps,why,pay_min_yr,pay_max_yr")
       .or("is_open.eq.true,closed_at.gt." + new Date(Date.now() - 60 * 864e5).toISOString()).order("score", { ascending: false }).limit(2000),
     sb.from("applications").select("*"),
     sb.from("runs").select("*").eq("kind", "ingest").order("started_at", { ascending: false }).limit(1),
