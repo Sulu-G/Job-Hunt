@@ -53,6 +53,8 @@ input[type=search]{flex:1 1 180px;min-width:0}
 .badges{display:flex;gap:6px;align-items:center}
 .tag{font:500 11px var(--mono);letter-spacing:.06em;text-transform:uppercase;padding:2px 8px;border-radius:3px;border:1px solid currentColor;white-space:nowrap}
 .tag.new{color:var(--new)} .Strong{color:var(--strong)} .Good{color:var(--good)} .Stretch{color:var(--stretch)} .tag.cl{color:var(--closed)}
+.pay{font:600 14px var(--mono);color:var(--strong);white-space:nowrap}
+.pay.none{font-weight:500;color:var(--muted)}
 .meta{display:flex;flex-wrap:wrap;gap:4px 14px;font:500 12px var(--mono);color:var(--muted)}
 .skills{display:flex;flex-wrap:wrap;gap:4px}
 .sk{font-size:12px;padding:1px 8px;border-radius:3px;background:var(--accent-soft);color:var(--fg)}
@@ -96,6 +98,7 @@ details summary{cursor:pointer;color:var(--accent);font-size:13px;font-weight:60
       <div id="lanes" class="filters" role="group" aria-label="Lane"></div>
       <div id="fits" class="filters" role="group" aria-label="Fit"></div>
       <button class="chip" id="tx" aria-pressed="false">Texas only</button>
+      <select id="sort" aria-label="Sort"><option value="fit">Best fit</option><option value="pay">Highest pay</option><option value="new">Newest</option></select>
       <input type="search" id="q" placeholder="Search company, title, skill…" aria-label="Search">
     </div>
     <p class="muted" id="summary" style="margin:10px 0 0"></p>
@@ -118,7 +121,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":
 const safe = (u) => /^https:\/\//.test(u || "") ? u : null;
 
 let postings = new Map(), apps = new Map(), lastRun = null, fresh = new Set();
-let stage = "New", lane = "All", fit = "All", tx = false, q = "", limit = 60;
+let stage = "New", lane = "All", fit = "All", tx = false, q = "", limit = 60, sortBy = "fit";
 
 function statusOf(p) { return apps.get(p.id)?.status || "New"; }
 function ago(d) { if (!d) return ""; const h = (Date.now() - new Date(d)) / 36e5; return h < 1 ? "just now" : h < 24 ? `${Math.round(h)}h ago` : `${Math.round(h/24)}d ago`; }
@@ -134,7 +137,16 @@ function visible() {
     if (tx && !/\b(TX|Texas)\b/.test(p.location || "")) return false;
     if (q) { const hay = `${p.company} ${p.title} ${p.location} ${(p.matched||[]).join(" ")}`.toLowerCase(); if (!hay.includes(q)) return false; }
     return true;
-  }).sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || new Date(b.first_seen_at) - new Date(a.first_seen_at));
+  }).sort((a, b) => sortBy === "pay" ? payValue(b) - payValue(a) || (b.score ?? 0) - (a.score ?? 0)
+      : sortBy === "new" ? new Date(b.first_seen_at) - new Date(a.first_seen_at)
+      : (b.score ?? 0) - (a.score ?? 0) || new Date(b.first_seen_at) - new Date(a.first_seen_at));
+}
+// Yearly value of the low end of the range, so hourly and salaried jobs sort together (hourly x 2080 hrs).
+function payValue(p) {
+  const m = (p.pay || "").match(/\$([\d,.]+)\s*(K)?/i); if (!m) return -1;
+  let n = parseFloat(m[1].replace(/,/g, "")) * (m[2] ? 1000 : 1);
+  if (/\/hr|hour/i.test(p.pay) || n < 250) n *= 2080;
+  return n;
 }
 // Companies like Amazon post the same role many times (one per opening). Show one card per role + place.
 function grouped(list) {
@@ -158,7 +170,7 @@ function render() {
   $("#tx").setAttribute("aria-pressed", tx);
 
   const rows = grouped(visible());
-  $("#summary").textContent = `${rows.length} ${rows.length === 1 ? "job" : "jobs"} · sorted by fit score`;
+  $("#summary").textContent = `${rows.length} ${rows.length === 1 ? "job" : "jobs"} · sorted by ${{ fit: "fit score", pay: "highest pay", new: "newest" }[sortBy]}`;
   if (!rows.length) {
     $("#list").innerHTML = `<div class="empty">${postings.size ? "Nothing here with these filters." : "No postings yet. The feed checks company job boards every 3 hours."}</div>`;
     $("#more").hidden = true; return;
@@ -177,7 +189,8 @@ function card(p) {
       <div class="badges">${isNew ? `<span class="tag new">New</span>` : ""}${p.is_open ? "" : `<span class="tag cl">Closed</span>`}
         ${p.fit ? `<span class="tag ${p.fit}">${p.fit} · ${p.score ?? "–"}</span>` : ""}</div>
     </div>
-    <div class="meta"><span>${esc(p.location || "")}</span>${p.pay ? `<span>${esc(p.pay)}</span>` : ""}<span>${esc(p.lane || "")}</span>
+    <div class="pay ${p.pay ? "" : "none"}">${p.pay ? esc(p.pay) : "Pay not listed"}</div>
+    <div class="meta"><span>${esc(p.location || "")}</span><span>${esc(p.lane || "")}</span>
       ${p._dupes > 1 ? `<span>${p._dupes} openings</span>` : ""}<span>found ${ago(p.first_seen_at)}</span>${p.last_checked_at ? `<span>checked ${ago(p.last_checked_at)}</span>` : ""}</div>
     ${!p.is_open ? `<div class="reason">${esc(p.close_reason || "No longer listed")} · ${ago(p.closed_at)}</div>` : ""}
     ${p.why ? `<div>${esc(p.why)}</div>` : ""}
@@ -219,6 +232,7 @@ document.addEventListener("focusout", async (e) => {
   const { error } = await sb.from("applications").update({ notes: a.notes, updated_at: a.updated_at }).eq("posting_id", id);
   alertBar(error ? "Couldn't save notes. Try again." : "Notes saved");
 });
+$("#sort").addEventListener("change", (e) => { sortBy = e.target.value; render(); });
 $("#q").addEventListener("input", (e) => { q = e.target.value.trim().toLowerCase(); render(); });
 $("#signout").addEventListener("click", async () => { await sb.auth.signOut(); location.reload(); });
 
