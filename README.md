@@ -1,9 +1,11 @@
 # Job Hunt Tracker
 
+**Live:** https://sulu-g.github.io/job-hunt/ (sign-in required)
+
 A live job-search dashboard I built for my move into data center operations, ServiceNow, and IT support roles.
 
 **What it does**
-- A Supabase Edge Function (Deno/TypeScript) pulls postings straight from company hiring systems — Greenhouse, Lever, Ashby, and Amazon Jobs — every 3 hours.
+- A Supabase Edge Function (Deno/TypeScript) pulls postings straight from company hiring systems — Greenhouse, Lever, Ashby, Workday, Oracle, and Amazon Jobs — every 3 hours (31 companies, including NVIDIA, Flex, Jabil, HPE, xAI, OpenAI, Anthropic, Equinix, QTS, and CyrusOne).
 - Each posting is filtered to US entry/mid-level roles and scored 0–100 against my actual skills (Cisco switch config, Python, Linux, rack integration, hardware troubleshooting), with the gaps listed honestly.
 - Every 4 hours it re-checks open postings and marks any that were taken down as **Closed**, so I never apply to a dead link.
 - The dashboard updates in real time (Supabase Realtime) and is locked to my login with Row Level Security.

@@ -10,7 +10,7 @@ const UA = { "User-Agent": "Mozilla/5.0 (job-hunt personal tracker)", "Accept": 
 
 type Raw = {
   external_id: string; company: string; title: string; location: string; url: string;
-  description: string; posted_at: string | null; pay: string | null;
+  description: string; posted_at: string | null; pay: string | null; closes_at?: string | null;
 };
 
 // ---------- helpers ----------
@@ -21,18 +21,54 @@ function strip(html: string): string {
   s = s.replace(/&(amp|lt|gt|quot|#39|nbsp);/g, (m) => ENT[m] ?? m).replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n));
   return s.replace(/[ \t]+/g, " ").replace(/\n\s*\n+/g, "\n").trim().slice(0, 20000);
 }
-async function getJSON(url: string) {
-  const r = await fetch(url, { headers: UA });
+async function getJSON(url: string, headers: Record<string, string> = {}) {
+  const r = await fetch(url, { headers: { ...UA, ...headers } });
   if (!r.ok) throw new Error(`${r.status} from ${new URL(url).host}`);
   return r.json();
 }
-const PAY_RE = /\$\s?\d[\d,]*(?:\.\d+)?\s*[kK]?(?:\s*(?:-|–|—|to)\s*\$?\s?\d[\d,]*(?:\.\d+)?\s*[kK]?)?(?:\s*(?:\/|per)\s*(?:hr|hour|year|yr|annum))?/;
-const findPay = (t: string) => (t.match(PAY_RE)?.[0] ?? null);
+// API keys live in Supabase Vault, never in code.
+async function secret(name: string): Promise<string> {
+  const { data, error } = await sb.rpc("get_feed_secret", { n: name });
+  if (error || !data) throw new Error(`missing secret ${name} — add it to the vault`);
+  return data as string;
+}
+// Pay: find a real range (or a single rate with a unit) and normalize it to "$X–$Y/hr" or "$XK–$YK/yr".
+const NUM = String.raw`\$?\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{1,2}))?\s*([kK])?`;
+const RANGE_RE = new RegExp(`${NUM}\\s*(?:-|–|—|to)\\s*${NUM}(?:\\s*(?:USD|usd))?(?:\\s*(?:\\/|per|an?)?\\s*(hr|hour|hourly|annually|annual|year|yr|annum|per-hour-wage|per-year-salary))?`, "g");
+const toNum = (int: string, dec?: string, k?: string) => (parseFloat(int.replace(/,/g, "") + (dec ? "." + dec : "")) * (k ? 1000 : 1));
+function fmtPay(min: number, max: number, unitHint = ""): string | null {
+  if (!(min > 0) || !(max >= min)) return null;
+  const hourly = /h(ou)?r/i.test(unitHint) || max < 250;
+  if (hourly) { if (max > 250 || min < 7) return null; const f = (n: number) => `$${n % 1 ? n.toFixed(2) : n}`; return `${f(min)}–${f(max)}/hr`; }
+  if (min < 20000 || max > 600000) return null;
+  const f = (n: number) => `$${Math.round(n / 1000)}K`; return `${f(min)}–${f(max)}/yr`;
+}
+// Annualized numbers for filtering/sorting: hourly x 2080 (full-time year).
+function payYears(pay: string | null): { pay_min_yr: number | null; pay_max_yr: number | null } {
+  const m = (pay || "").match(/\$([\d.]+)(K)?–\$([\d.]+)(K)?\/(hr|yr)/);
+  if (!m) return { pay_min_yr: null, pay_max_yr: null };
+  const k = (v: string, K?: string) => parseFloat(v) * (K ? 1000 : 1) * (m[5] === "hr" ? 2080 : 1);
+  return { pay_min_yr: Math.round(k(m[1], m[2])), pay_max_yr: Math.round(k(m[3], m[4])) };
+}
+function findPay(text: string): string | null {
+  if (!text) return null;
+  // Prefer ranges that sit near pay words; otherwise take the first plausible range.
+  const cands: { pay: string; near: boolean }[] = [];
+  for (const m of text.matchAll(RANGE_RE)) {
+    const raw = m[0]; if (!/\$|usd/i.test(raw) && !/(hourly|annually)/i.test(raw)) continue;
+    const pay = fmtPay(toNum(m[1], m[2], m[3]), toNum(m[4], m[5], m[6]), m[7] || "");
+    if (!pay) continue;
+    const ctx = text.slice(Math.max(0, (m.index ?? 0) - 160), (m.index ?? 0)).toLowerCase();
+    cands.push({ pay, near: /(pay|salary|compensation|wage|base|range|rate)/.test(ctx) });
+  }
+  return (cands.find((c) => c.near) || cands[0])?.pay ?? null;
+}
+const cleanPay = (p: string | null | undefined) => (p ? (findPay(p) ?? null) : null);
 
 // ---------- source adapters ----------
 async function fromGreenhouse(slug: string, company: string): Promise<Raw[]> {
   const d = await getJSON(`https://boards-api.greenhouse.io/v1/boards/${slug}/jobs?content=true`);
-  return (d.jobs || []).map((j: any) => {
+  return (d.jobs || []).filter((j: any) => laneOf(j.title || "")).map((j: any) => {
     const desc = strip(j.content || "");
     return { external_id: String(j.id), company, title: j.title, location: j.location?.name || "", url: j.absolute_url,
       description: desc, posted_at: j.first_published || j.updated_at || null, pay: findPay(desc) };
@@ -40,21 +76,21 @@ async function fromGreenhouse(slug: string, company: string): Promise<Raw[]> {
 }
 async function fromLever(slug: string, company: string): Promise<Raw[]> {
   const d = await getJSON(`https://api.lever.co/v0/postings/${slug}?mode=json&limit=500`);
-  return (Array.isArray(d) ? d : []).map((j: any) => {
+  return (Array.isArray(d) ? d : []).filter((j: any) => laneOf(j.text || "")).map((j: any) => {
     const lists = (j.lists || []).map((l: any) => `${l.text}\n${strip(l.content)}`).join("\n");
     const desc = [j.descriptionPlain, lists, j.additionalPlain].filter(Boolean).join("\n").slice(0, 20000);
-    const sr = j.salaryRange ? `$${j.salaryRange.min}–$${j.salaryRange.max}/${j.salaryRange.interval || "yr"}` : null;
+    const sr = j.salaryRange ? fmtPay(+j.salaryRange.min, +j.salaryRange.max, j.salaryRange.interval || "") : null;
     return { external_id: j.id, company, title: j.text, location: j.categories?.location || j.categories?.allLocations?.join("; ") || "",
       url: j.hostedUrl, description: desc, posted_at: j.createdAt ? new Date(j.createdAt).toISOString() : null, pay: sr || findPay(desc) };
   });
 }
 async function fromAshby(slug: string, company: string): Promise<Raw[]> {
   const d = await getJSON(`https://api.ashbyhq.com/posting-api/job-board/${slug}?includeCompensation=true`);
-  return (d.jobs || []).filter((j: any) => j.isListed !== false).map((j: any) => {
+  return (d.jobs || []).filter((j: any) => j.isListed !== false && laneOf(j.title || "")).map((j: any) => {
     const desc = (j.descriptionPlain || strip(j.descriptionHtml || "")).slice(0, 20000);
     const loc = [j.location, ...(j.secondaryLocations || []).map((s: any) => s.location)].filter(Boolean).join("; ");
     return { external_id: j.id, company, title: j.title, location: loc + (j.isRemote ? " (Remote)" : ""), url: j.jobUrl,
-      description: desc, posted_at: j.publishedAt || null, pay: j.compensation?.compensationTierSummary || findPay(desc) };
+      description: desc, posted_at: j.publishedAt || null, pay: cleanPay(j.compensation?.compensationTierSummary) || findPay(desc) };
   });
 }
 async function fromAmazon(queries: string, company: string): Promise<Raw[]> {
@@ -68,25 +104,157 @@ async function fromAmazon(queries: string, company: string): Promise<Raw[]> {
       const eid = String(j.id_icims || j.id); if (ids.has(eid)) continue; ids.add(eid);
       out.push({ external_id: eid, company, title: j.title, location: j.normalized_location || j.location || "",
         url: "https://www.amazon.jobs" + j.job_path, description: desc,
-        posted_at: j.posted_date ? new Date(j.posted_date).toISOString() : null, pay: findPay(desc) });
+        posted_at: j.posted_date ? new Date(j.posted_date).toISOString() : null,
+        pay: findPay(JSON.stringify([j.description, j.basic_qualifications, j.preferred_qualifications, j.description_short]).replace(/\\n/g, " ")) });
     }
     if (jobs.length < 100) break;
   }
   return out;
 }
+// Workday: slug = "tenant|wdN|site|query1;query2". Search is keyword-based, so liveness is checked per URL in verify().
+async function postJSON(url: string, body: unknown) {
+  const r = await fetch(url, { method: "POST", headers: { ...UA, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(`${r.status} from ${new URL(url).host}`);
+  return r.json();
+}
+// Skip postings that are clearly outside the US (Workday search is global).
+const FOREIGN = /^(?!.*\b(United States|USA|US)\b).*\b(India|China|Taiwan|Japan|Korea|Singapore|Israel|Germany|Ireland|Netherlands|UK|United Kingdom|Canada|Mexico|Poland|France|Australia|Brazil)\b/i;
+const WD_QUERIES = "data center;datacenter technician;servicenow;IT support;hardware technician;NPI engineer;manufacturing engineer;rack integration";
+async function fromWorkday(slug: string, company: string): Promise<Raw[]> {
+  const [tenant, wd, site, q] = slug.split("|");
+  const host = `https://${tenant}.${wd}.myworkdayjobs.com`, api = `${host}/wday/cxs/${tenant}/${site}`;
+  const hits = new Map<string, any>();
+  for (const query of (q || WD_QUERIES).split(";")) {
+    for (let offset = 0; offset < 100; offset += 20) {
+      const d = await postJSON(`${api}/jobs`, { appliedFacets: {}, limit: 20, offset, searchText: query });
+      for (const j of d.jobPostings || []) if (j.externalPath && laneOf(j.title || "") && !FOREIGN.test(j.locationsText || "")) hits.set(j.externalPath, j);
+      if (!d.jobPostings || d.jobPostings.length < 20) break;
+    }
+  }
+  const out: Raw[] = [];
+  for (const [path, j] of hits) {
+    try {
+      const d = await getJSON(`${api}${path}`);
+      const info = d.jobPostingInfo || {};
+      const desc = strip(info.jobDescription || "");
+      const loc = [info.location, ...(info.additionalLocations || [])].filter(Boolean).join("; ") || j.locationsText || "";
+      out.push({ external_id: path, company, title: info.title || j.title, location: loc, url: info.externalUrl || `${host}/${site}${path}`,
+        description: desc, posted_at: info.startDate ? new Date(info.startDate).toISOString() : null, pay: findPay(desc) });
+    } catch (_) { /* skip one bad detail */ }
+  }
+  return out;
+}
+// Oracle Recruiting Cloud: slug = "host|siteNumber|query1;query2"
+async function fromOracle(slug: string, company: string): Promise<Raw[]> {
+  const [host, site, q] = slug.split("|");
+  const base = `https://${host}/hcmRestApi/resources/latest`;
+  const hits = new Map<string, any>();
+  for (const query of (q || "data center technician;data center").split(";")) {
+    const d = await getJSON(`${base}/recruitingCEJobRequisitions?onlyData=true&expand=requisitionList&finder=findReqs;siteNumber=${site},keyword=${encodeURIComponent('"' + query + '"')},limit=100,sortBy=POSTING_DATES_DESC`);
+    for (const r of d.items?.[0]?.requisitionList || []) if (laneOf(r.Title || "")) hits.set(String(r.Id), r);
+  }
+  const out: Raw[] = [];
+  for (const [id, r] of hits) {
+    try {
+      const d = await getJSON(`${base}/recruitingCEJobRequisitionDetails?expand=all&onlyData=true&finder=ById;Id=%22${id}%22,siteNumber=${site}`);
+      const it = d.items?.[0] || {};
+      const desc = strip([it.ExternalDescriptionStr, it.ExternalQualificationsStr, it.ExternalResponsibilitiesStr].filter(Boolean).join("\n"));
+      out.push({ external_id: id, company, title: r.Title, location: r.PrimaryLocation || "", url: `https://careers.oracle.com/jobs/#en/sites/jobsearch/job/${id}`,
+        description: desc, posted_at: r.PostedDate ? new Date(r.PostedDate).toISOString() : null, pay: findPay(desc) });
+    } catch (_) { /* skip */ }
+  }
+  return out;
+}
+// Microsoft (Eightfold PCS): slug = "query1;query2"
+async function fromMicrosoft(slug: string, company: string): Promise<Raw[]> {
+  const base = "https://apply.careers.microsoft.com/api/pcsx";
+  const hits = new Map<string, any>();
+  for (const query of (slug || "datacenter technician").split(";")) {
+    for (let start = 0; start < 100; start += 10) {
+      await new Promise((r) => setTimeout(r, 1500)); // Microsoft rate-limits fast clients
+      const d = await getJSON(`${base}/search?domain=microsoft.com&query=${encodeURIComponent(query)}&location=United%20States&start=${start}&sort_by=timestamp`);
+      const pos = d.data?.positions || [];
+      for (const p of pos) if (laneOf(p.name || "")) hits.set(String(p.id), p);
+      if (pos.length < 10) break;
+    }
+  }
+  const out: Raw[] = [];
+  for (const [id, p] of hits) {
+    try {
+      await new Promise((r) => setTimeout(r, 800));
+      const d = await getJSON(`${base}/position_details?position_id=${id}&domain=microsoft.com&hl=en`);
+      const desc = strip(d.data?.jobDescription || "");
+      out.push({ external_id: id, company, title: p.name, location: (p.locations || p.standardizedLocations || []).join("; "),
+        url: p.positionUrl ? `https://apply.careers.microsoft.com${p.positionUrl}` : `https://apply.careers.microsoft.com/careers/job/${id}`,
+        description: desc, posted_at: p.postedTs ? new Date(p.postedTs * 1000).toISOString() : null, pay: findPay(desc) });
+    } catch (_) { /* skip */ }
+  }
+  return out;
+}
+// USAJobs (federal): slug = location, e.g. "Anchorage, Alaska". Needs vault secrets usajobs_key + usajobs_email.
+async function fromUSAJobs(slug: string, _company: string): Promise<Raw[]> {
+  const headers = { "Host": "data.usajobs.gov", "User-Agent": await secret("usajobs_email"), "Authorization-Key": await secret("usajobs_key") };
+  const out: Raw[] = [];
+  for (let page = 1; page <= 10; page++) {
+    const d = await getJSON(`https://data.usajobs.gov/api/search?LocationName=${encodeURIComponent(slug)}&Radius=40&ResultsPerPage=250&Page=${page}`, headers);
+    const items = d.SearchResult?.SearchResultItems || [];
+    for (const it of items) {
+      const m = it.MatchedObjectDescriptor || {}; const det = m.UserArea?.Details || {};
+      const rem = (m.PositionRemuneration || [])[0] || {};
+      const per = /hour/i.test(rem.RateIntervalCode || rem.Description || "") ? "hr" : "yr";
+      const pay = rem.MinimumRange ? fmtPay(+rem.MinimumRange, +rem.MaximumRange || +rem.MinimumRange, per) : null;
+      const desc = [det.JobSummary, m.QualificationSummary, (det.MajorDuties || []).join("\n"), det.Requirements, det.Education,
+        det.SecurityClearance && det.SecurityClearance !== "Not Required" ? `Security clearance: ${det.SecurityClearance} clearance required` : ""]
+        .filter(Boolean).join("\n").slice(0, 20000);
+      out.push({ external_id: String(m.PositionID || it.MatchedObjectId), company: m.OrganizationName || m.DepartmentName || "US Government",
+        title: m.PositionTitle, location: m.PositionLocationDisplay || slug, url: m.PositionURI || (m.ApplyURI || [])[0],
+        description: desc, posted_at: m.PublicationStartDate || null, pay, closes_at: m.ApplicationCloseDate || null });
+    }
+    if (items.length < 250) break;
+  }
+  return out;
+}
+// Adzuna (aggregator, every employer): slug = "where|salary_min". Needs vault secrets adzuna_app_id + adzuna_app_key.
+async function fromAdzuna(slug: string, _company: string): Promise<Raw[]> {
+  const [where, salaryMin] = slug.split("|");
+  const id = await secret("adzuna_app_id"), key = await secret("adzuna_app_key");
+  const out: Raw[] = [];
+  for (let page = 1; page <= 20; page++) {
+    const d = await getJSON(`https://api.adzuna.com/v1/api/jobs/us/search/${page}?app_id=${id}&app_key=${key}&results_per_page=50&where=${encodeURIComponent(where)}&distance=40&max_days_old=30&salary_min=${salaryMin || 0}&salary_include_unknown=1&content-type=application/json`);
+    const res = d.results || [];
+    for (const j of res) {
+      let pay = j.salary_min ? fmtPay(+j.salary_min, +(j.salary_max || j.salary_min), +(j.salary_max || 0) < 250 ? "hr" : "") : null;
+      if (pay && String(j.salary_is_predicted) === "1") pay += " (est.)";
+      out.push({ external_id: String(j.id), company: j.company?.display_name || "Unknown employer", title: (j.title || "").replace(/<[^>]+>/g, ""),
+        location: j.location?.display_name || where, url: j.redirect_url, description: strip(j.description || ""),
+        posted_at: j.created || null, pay });
+    }
+    if (res.length < 50) break;
+  }
+  return out;
+}
 const ADAPTERS: Record<string, (slug: string, company: string) => Promise<Raw[]>> = {
   greenhouse: fromGreenhouse, lever: fromLever, ashby: fromAshby, amazon: fromAmazon,
+  workday: fromWorkday, oracle: fromOracle, microsoft: fromMicrosoft, usajobs: fromUSAJobs, adzuna: fromAdzuna,
 };
+// Keyword-search sources can't prove a job closed by its absence; verify() checks those by URL.
+const PARTIAL = new Set(["amazon", "workday", "oracle", "microsoft", "adzuna"]);
+// Region sources (e.g. Anchorage) accept any field, not just tech lanes.
+const AK_RE = /(anchorage|eagle river|chugiak|girdwood|\bjber\b|elmendorf|fort richardson|wasilla|palmer|\balaska\b|,\s*AK\b)/i;
+const EXEC = /\b(director|vice president|\bvp\b|chief|president|head of|principal|partner|supervisory)\b/i;
+const LICENSED = /(physician|surgeon|surgical|dentist|dental|hygien|pharmac|nurs(e|ing)\b|\brn\b|\blpn\b|\bcna\b|attorney|lawyer|counsel|psycholog|therap|social worker|teacher|professor|\bpilot\b|first officer|captain|veterinar|optometr|audiolog|rehab|radiolog|sonograph|technologist|\bmri\b|\bct\b|cath lab|x-?ray|paramedic|\bemt\b|anesthes|midwife|physician assistant|\bnp\b|pa-c|behavioral health|mental health|clinical|clinician|phlebotom|respiratory|dietitian|speech|hospitalist|(civil|structural|geotechnical|hydraulic|environmental|electrical|mechanical) engineer|\(hydraulics\)|accountant|\bcpa\b|actuar|surg tech|cvor|allied health)/i;
 
 // ---------- relevance + fit scoring (Sultan's verified profile) ----------
-const SENIOR = /\b(senior|sr\.?|staff|principal|lead|manager|director|head|chief|architect|vp|president|iii|iv|v\b|intern|internship|counsel|recruiter|sales|account|construction|project|program|security|electrical|mechanical|controls|commissioning|facilit(y|ies)|civil|design|planner|procurement|logistics|finance|legal|marketing|quality)\b/i;
+const SENIOR = /\b(senior|sr\.?|staff|principal|lead|manager|director|head|chief|architect|vp|president|iii|iv|v\b|intern|internship|counsel|recruiter|sales|account|construction|project|program|security|electrical|mechanical|controls|commissioning|facilit(y|ies)|civil|design|planner|procurement|logistics|finance|legal|marketing|quality|software|developer|sde|early access|forward[- ]deployed|supervisor|scientist|researcher|machine learning|ml)\b/i;
 function laneOf(title: string): string | null {
   if (SENIOR.test(title)) return null;
   if (/servicenow/i.test(title)) return "ServiceNow";
-  if (/(data ?cent(er|re)|datacenter|\bdco\b|critical (facilit|environment)|server (tech|operations)|hardware (tech|operations|deployment)|fleet (tech|operations)|deployment tech|rack (integration|tech)|infrastructure tech)/i.test(title)
+  if (/(data ?cent(er|re)|datacenter|\bdco\b|critical (facilit|environment)|server (tech|operations)|hardware (tech|operations|deployment)|fleet (tech|operations)|deployment (tech|engineer)|rack (integration|tech)|infrastructure tech|(hardware|server|systems?|network) (integration|deployment) (engineer|tech)|site (reliability|operations) tech)/i.test(title)
       && /(tech|operations|specialist|associate|engineer|deployment|integrat)/i.test(title)) return "Data Center";
+  if (/(\bnpi\b|new product introduction|manufacturing engineer|process engineer|product engineer|production engineer|test engineer|rack integration|(system|systems|hardware|server|rack) (integration|validation|test|operations|reliability|bring[- ]?up) engineer|hardware engineering technician|failure analysis)/i.test(title)
+      && !/(chemical|petroleum|refin|pipeline|drilling|subsea|reservoir|pharma|biolog|food|civil|structural|\btpm\b|motors?|actuators?|propulsion|aerospace|space|thermo|mechatronic|dynamics|robotic|battery|vehicle|wafer|\bai\b)/i.test(title)) return "Hardware / NPI";
   if (/(it support|help ?desk|service desk|desktop support|end[- ]user support|it technician|it specialist|it operations (tech|specialist|analyst)|technical support (specialist|analyst|technician)|support technician|it analyst)/i.test(title)) return "IT Support";
-  if (/(systems? administrator|sysadmin|linux administrator|infrastructure administrator|systems? technician)/i.test(title)) return "Sysadmin";
+  if (/(systems? administrator|sysadmin|linux administrator|infrastructure administrator|systems? technician|network (administrator|technician|specialist)|it administrator|telecom(munications)? technician)/i.test(title)) return "Sysadmin";
   return null;
 }
 const US_STATES = "AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC";
@@ -106,6 +274,12 @@ const HAVE: [string, RegExp][] = [
   ["CS degree", /(bachelor|associate'?s|degree|computer science)/i], ["Google IT Support cert", /google it support/i],
   ["24/7 shifts", /(24\/7|nights|weekends|rotating shift|on-?call)/i], ["GPU / AI hardware", /\b(gpu|nvidia|ai infrastructure|hpc)\b/i],
   ["Physical work (lift 50 lb)", /lift.{0,20}(40|50|60) ?(lb|pound)/i], ["ServiceNow (training)", /servicenow/i],
+  ["NPI / process validation", /(\bnpi\b|new product introduction|process validation|pilot build|bring[- ]?up)/i],
+  ["Production metrics / yield", /(yield|throughput|production metrics|corrective action|\bcapa\b|\b8d\b)/i],
+  ["Manufacturing / assembly floor", /(manufacturing|assembly|production line|factory|contract manufactur|\bodm\b|\bcm\b)/i],
+  ["Cross-functional (mfg/quality/eng)", /(cross[- ]functional|quality team|engineering teams?)/i],
+  ["Corrections / public safety", /(correction|detention|law enforcement|public safety|security officer|inmate|jail|tcole|peace officer)/i],
+  ["Shift work / physical", /(shift work|rotational|rotation|on-?call|outdoor|physically demanding)/i],
 ];
 const LACK: [string, RegExp][] = [
   ["Bash", /\bbash\b/i], ["Juniper/JunOS", /(juniper|junos)/i], ["ITIL", /\bitil\b/i],
@@ -115,9 +289,15 @@ const LACK: [string, RegExp][] = [
   ["M365 / Google Workspace admin", /(m365|microsoft 365|office 365|google workspace|intune|jamf|\bmdm\b)/i],
   ["CompTIA A+/Network+", /(comptia|\ba\+|network\+|security\+)/i], ["CCNA", /\bccna\b/i],
   ["Electrical/HVAC/mechanical", /(electrical (systems|work)|hvac|mechanical systems|generator|ups systems|switchgear|fire suppression)/i],
+  ["Six Sigma / SPC / DFM", /(six sigma|lean six|\bspc\b|statistical process control|\bdfm\b|\bdfx\b|\bfmea\b)/i],
+  ["CAD (SolidWorks/AutoCAD)", /(solidworks|autocad|\bcreo\b|\bcatia\b|\bnx cad\b)/i],
+  ["ME/EE/IE degree", /(degree|bachelor'?s|bs|b\.s\.)[^.\n]{0,40}(mechanical|electrical|industrial|manufacturing) engineering/i],
+  ["PLC / automation", /(\bplc\b|ladder logic|robotics programming)/i],
+  ["CDL license", /(\bcdl\b|commercial driver)/i],
+  ["Trade license (journeyman)", /(journeyman|licensed (electrician|plumber|welder)|apprenticeship completion)/i],
 ];
 const CLEARANCE = /(active (secret|ts|top secret)|(secret|ts\/sci|top secret|public trust) clearance|clearance (is )?required|must (hold|possess) .{0,20}clearance)/i;
-const MY_YEARS: Record<string, number> = { "Data Center": 4, "IT Support": 4, "Sysadmin": 1, "ServiceNow": 0 };
+const MY_YEARS: Record<string, number> = { "Data Center": 4, "Hardware / NPI": 1, "IT Support": 4, "Sysadmin": 1, "ServiceNow": 0, "Anchorage – other fields": 4 };
 
 function yearsRequired(desc: string): number | null {
   const req = desc.match(/(minimum|basic|required|requirements|qualifications|what you'll need|you have|must have)[\s\S]{0,2500}/i)?.[0] || desc;
@@ -131,16 +311,18 @@ function score(r: Raw, lane: string) {
   const text = `${r.title}\n${r.description}`;
   if (CLEARANCE.test(text)) return null;
   const matched = HAVE.filter(([, re]) => re.test(text)).map(([k]) => k);
-  const gaps = LACK.filter(([, re]) => re.test(text)).map(([k]) => k);
+  // Hardware/NPI roles only count when the work is on computer/server hardware.
+  if (lane === "Hardware / NPI" && !/(server|\brack|data ?cent|pcba?\b|electronic|computer hardware|\bgpu|network(ing)? (equipment|hardware)|\bsmt\b|system integration)/i.test(text)) return null;
+  const snow = /servicenow/i.test(text);
+  const gaps = LACK.filter(([k, re]) => (snow || !/^ServiceNow/.test(k)) && re.test(text)).map(([k]) => k);
   const yrs = yearsRequired(r.description);
-  let s = ({ "Data Center": 58, "IT Support": 48, "Sysadmin": 38, "ServiceNow": 32 } as Record<string, number>)[lane];
+  let s = ({ "Data Center": 58, "Hardware / NPI": 54, "IT Support": 48, "Sysadmin": 38, "ServiceNow": 32, "Anchorage – other fields": 46 } as Record<string, number>)[lane] ?? 46;
   if (lane === "ServiceNow" && /(junior|jr\.?|associate|entry|early career|graduate|trainee|apprentice)/i.test(r.title + " " + r.description.slice(0, 600))) s += 22;
   if (/\btechnician\b/i.test(r.title) && lane === "Data Center") s += 4;
   s += Math.min(matched.length * 4, 32);
   s -= Math.min(gaps.length * 6, 30);
   if (gaps.includes("Electrical/HVAC/mechanical")) s -= 16; // facilities-engineering roles, not his background
   if (yrs != null && Number.isFinite(yrs) && yrs > MY_YEARS[lane]) { s -= (yrs - MY_YEARS[lane]) * 9; gaps.unshift(`${yrs}+ yrs required`); }
-  if (/\b(TX|Texas)\b/.test(r.location)) s += 3;
   s = Math.max(0, Math.min(100, Math.round(s)));
   const fit = s >= 75 ? "Strong" : s >= 55 ? "Good" : "Stretch";
   const why = matched.length ? `Matches your ${matched.slice(0, 6).join(", ")}.` : "Few direct keyword matches; review manually.";
@@ -162,14 +344,19 @@ async function ingest(onlySource?: number) {
       const known = new Map((existing || []).map((e: any) => [e.external_id, e]));
       const seen = new Set<string>(); const rows: any[] = [];
       for (const r of raws) {
-        const lane = laneOf(r.title);
-        if (!lane || !isUS(r.location) || !r.url) continue;
+        let lane = laneOf(r.title);
+        if (src.region === "anchorage") {
+          if (!AK_RE.test(r.location) || EXEC.test(r.title) || LICENSED.test(r.title) || /clearance/i.test(r.title) || !/[a-z]{3}/i.test(r.title)) continue;
+          if (r.closes_at && new Date(r.closes_at) < new Date()) continue;
+          lane = lane || "Anchorage – other fields";
+        }
+        if (!lane || !r.url || (src.region !== "anchorage" && !isUS(r.location))) continue;
         const sc = score(r, lane); if (!sc) continue;
         if (seen.has(r.external_id)) continue;
         seen.add(r.external_id);
         const row: any = { source_id: src.id, external_id: r.external_id, company: r.company, title: r.title, location: r.location,
           url: r.url, lane, pay: r.pay, description: r.description, posted_at: r.posted_at, last_seen_at: new Date().toISOString(),
-          is_open: true, closed_at: null, close_reason: null, ...sc };
+          is_open: true, closed_at: null, close_reason: null, ...sc, ...payYears(r.pay) };
         if (!known.has(r.external_id)) newCount++;
         rows.push(row);
       }
@@ -177,13 +364,20 @@ async function ingest(onlySource?: number) {
         const { error } = await sb.from("postings").upsert(rows.slice(i, i + 200), { onConflict: "source_id,external_id" });
         if (error) throw new Error(error.message);
       }
-      // Gone from a full company board = closed. Amazon search is partial, so it is verified by URL instead.
-      if (src.kind !== "amazon" && raws.length > 0) {
+      // Gone from a full company board = closed (boards are pre-filtered to relevant titles). Keyword-search sources are verified by URL instead.
+      if (!PARTIAL.has(src.kind) && raws.length > 0) {
         const gone = (existing || []).filter((e: any) => e.is_open && !seen.has(e.external_id)).map((e: any) => e.id);
         if (gone.length) {
           await sb.from("postings").update({ is_open: false, closed_at: new Date().toISOString(), close_reason: "Removed from company job board" }).in("id", gone);
           closedCount += gone.length;
         }
+      }
+      // Aggregator listings that haven't appeared for 3 days are treated as closed.
+      if (src.kind === "adzuna" && raws.length > 0) {
+        const stale = new Date(Date.now() - 72 * 3600e3).toISOString();
+        const { data: old } = await sb.from("postings").update({ is_open: false, closed_at: new Date().toISOString(), close_reason: "No longer listed" })
+          .eq("source_id", src.id).eq("is_open", true).lt("last_seen_at", stale).select("id");
+        closedCount += old?.length || 0;
       }
       await sb.from("sources").update({ last_run_at: new Date().toISOString(), last_status: "ok", last_count: rows.length, last_error: null }).eq("id", src.id);
     } catch (e) {
@@ -204,7 +398,10 @@ async function verify() {
   let closed = 0, checked = 0; const errors: string[] = [];
   await Promise.all((rows || []).map(async (p: any) => {
     try {
-      const r = await fetch(p.url, { headers: UA, redirect: "follow" });
+      let target = p.url;
+      const wd = p.url.match(/^https:\/\/([^.]+)\.(wd\d+)\.myworkdayjobs\.com\/(?:[a-z]{2}-[A-Z]{2}\/)?([^/]+)(\/job\/.+)$/);
+      if (wd) target = `https://${wd[1]}.${wd[2]}.myworkdayjobs.com/wday/cxs/${wd[1]}/${wd[3]}${wd[4]}`;
+      const r = await fetch(target, { headers: UA, redirect: "follow" });
       checked++;
       let reason: string | null = null;
       if (r.status === 404 || r.status === 410) reason = `Posting page returned ${r.status}`;
@@ -219,14 +416,16 @@ async function verify() {
   return { checked, closed, errors };
 }
 
-async function probe() {
-  const { data: sources } = await sb.from("sources").select("*").neq("kind", "manual");
+async function probe(candidates?: any[]) {
+  const { data: saved } = candidates ? { data: null } : await sb.from("sources").select("*").neq("kind", "manual");
+  const sources = candidates || saved;
   const out: any[] = [];
   await Promise.all((sources || []).map(async (s: any) => {
     try {
       const raws = await ADAPTERS[s.kind](s.slug, s.company);
       const relevant = raws.filter((r) => laneOf(r.title) && isUS(r.location)).length;
-      out.push({ id: s.id, company: s.company, kind: s.kind, total: raws.length, relevant });
+      out.push({ id: s.id, company: s.company, kind: s.kind, total: raws.length, relevant,
+        sample: s.region || s.sample ? raws.slice(0, 8).map((r) => `${r.title} | ${r.location} | ${r.pay}`) : undefined });
     } catch (e) { out.push({ id: s.id, company: s.company, kind: s.kind, error: (e as Error).message }); }
   }));
   return out;
@@ -239,7 +438,8 @@ Deno.serve(async (req) => {
   const url = new URL(req.url);
   const mode = url.searchParams.get("mode") || "ingest";
   try {
-    const result = mode === "verify" ? await verify() : mode === "probe" ? await probe()
+    const body = req.method === "POST" ? await req.json().catch(() => ({})) : {};
+    const result = mode === "verify" ? await verify() : mode === "probe" ? await probe(body.candidates)
       : await ingest(url.searchParams.get("source") ? +url.searchParams.get("source")! : undefined);
     return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
   } catch (e) {
