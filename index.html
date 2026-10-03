@@ -207,9 +207,9 @@ function card(p) {
     ${p.why ? `<div>${esc(p.why)}</div>` : ""}
     <div class="skills">${(p.matched || []).map((m) => `<span class="sk">${esc(m)}</span>`).join("")}${(p.gaps || []).map((g) => `<span class="sk gap" title="Gap">${esc(g)}</span>`).join("")}</div>
     <div class="ctl">
-      ${st === "New" ? `<button class="btn primary" data-set="Saved">Save</button><button class="btn" data-set="Applied">I applied</button><button class="btn" data-set="Not interested">Not for me</button>`
+      ${st === "New" ? `<button class="btn primary" data-set="Saved" title="Saves it and queues a tailored resume + cover letter for Monday">Save + make resume</button><button class="btn" data-set="Applied">I applied</button><button class="btn" data-set="Not interested">Not for me</button>`
         : `<label class="muted" for="s-${p.id}">Status</label><select id="s-${p.id}" data-status>${["Saved","Applied","Interview","Offer","Closed","Not interested"].map((s) => `<option ${s === st ? "selected" : ""}>${s}</option>`).join("")}</select>
-           ${a?.applied_at ? `<span class="muted">Applied ${esc(a.applied_at)}</span>` : ""}${a?.resume_folder ? `<span class="muted">Resume: ${esc(a.resume_folder)}</span>` : ""}`}
+           ${a?.applied_at ? `<span class="muted">Applied ${esc(a.applied_at)}</span>` : ""}${a?.resume_folder ? `<span class="muted">Resume ready: ${esc(a.resume_folder)}</span>` : st === "Saved" ? `<span class="muted">Resume coming in Monday's scan</span>` : ""}`}
     </div>
     ${st !== "New" ? `<textarea id="n-${p.id}" data-notes placeholder="Notes: recruiter, follow-up date, interview prep…">${esc(a?.notes || "")}</textarea>` : ""}
     ${p.description ? `<details><summary>Full posting</summary><div class="desc">${esc(p.description)}</div></details>` : ""}
