@@ -196,7 +196,8 @@ async function fromUSAJobs(slug: string, _company: string): Promise<Raw[]> {
   const headers = { "Host": "data.usajobs.gov", "User-Agent": await secret("usajobs_email"), "Authorization-Key": await secret("usajobs_key") };
   const out: Raw[] = [];
   for (let page = 1; page <= 10; page++) {
-    const d = await getJSON(`https://data.usajobs.gov/api/search?LocationName=${encodeURIComponent(slug)}&Radius=40&ResultsPerPage=250&Page=${page}`, headers);
+    const q = slug.startsWith("remote:") ? `RemoteIndicator=True&JobCategoryCode=${slug.slice(7)}` : `LocationName=${encodeURIComponent(slug)}&Radius=40`;
+    const d = await getJSON(`https://data.usajobs.gov/api/search?${q}&ResultsPerPage=250&Page=${page}`, headers);
     const items = d.SearchResult?.SearchResultItems || [];
     for (const it of items) {
       const m = it.MatchedObjectDescriptor || {}; const det = m.UserArea?.Details || {};
@@ -207,45 +208,115 @@ async function fromUSAJobs(slug: string, _company: string): Promise<Raw[]> {
         det.SecurityClearance && det.SecurityClearance !== "Not Required" ? `Security clearance: ${det.SecurityClearance} clearance required` : ""]
         .filter(Boolean).join("\n").slice(0, 20000);
       out.push({ external_id: String(m.PositionID || it.MatchedObjectId), company: m.OrganizationName || m.DepartmentName || "US Government",
-        title: m.PositionTitle, location: m.PositionLocationDisplay || slug, url: m.PositionURI || (m.ApplyURI || [])[0],
+        title: m.PositionTitle, location: (m.PositionLocationDisplay || slug) + (det.RemoteIndicator === true || det.RemoteIndicator === "True" ? " (Remote)" : ""), url: m.PositionURI || (m.ApplyURI || [])[0],
         description: desc, posted_at: m.PublicationStartDate || null, pay, closes_at: m.ApplicationCloseDate || null });
     }
     if (items.length < 250) break;
   }
   return out;
 }
-// Adzuna (aggregator, every employer): slug = "where|salary_min". Needs vault secrets adzuna_app_id + adzuna_app_key.
+// Adzuna (aggregator, every employer): slug = "where|salary_min|what|what_or" (where optional). Needs vault secrets adzuna_app_id + adzuna_app_key.
 async function fromAdzuna(slug: string, _company: string): Promise<Raw[]> {
-  const [where, salaryMin] = slug.split("|");
+  const [where, salaryMin, what, whatOr] = slug.split("|");
+  const geo = where ? `&where=${encodeURIComponent(where)}&distance=40` : "";
+  const kw = (what ? `&what=${encodeURIComponent(what)}` : "") + (whatOr ? `&what_or=${encodeURIComponent(whatOr)}` : "");
   const id = await secret("adzuna_app_id"), key = await secret("adzuna_app_key");
   const out: Raw[] = [];
-  for (let page = 1; page <= 20; page++) {
-    const d = await getJSON(`https://api.adzuna.com/v1/api/jobs/us/search/${page}?app_id=${id}&app_key=${key}&results_per_page=50&where=${encodeURIComponent(where)}&distance=40&max_days_old=30&salary_min=${salaryMin || 0}&salary_include_unknown=1&content-type=application/json`);
+  for (let page = 1; page <= 10; page++) {
+    if (page > 1) await new Promise((r) => setTimeout(r, 2500)); // Adzuna free tier rate limit
+    const d = await getJSON(`https://api.adzuna.com/v1/api/jobs/us/search/${page}?app_id=${id}&app_key=${key}&results_per_page=50${geo}${kw}&max_days_old=30&salary_min=${salaryMin || 0}&salary_include_unknown=1&content-type=application/json`);
     const res = d.results || [];
     for (const j of res) {
       let pay = j.salary_min ? fmtPay(+j.salary_min, +(j.salary_max || j.salary_min), +(j.salary_max || 0) < 250 ? "hr" : "") : null;
       if (pay && String(j.salary_is_predicted) === "1") pay += " (est.)";
       out.push({ external_id: String(j.id), company: j.company?.display_name || "Unknown employer", title: (j.title || "").replace(/<[^>]+>/g, ""),
-        location: j.location?.display_name || where, url: j.redirect_url, description: strip(j.description || ""),
+        location: [j.location?.display_name, ...(j.location?.area || []).slice(0, 2)].filter(Boolean).join(", ") || where || "US", url: j.redirect_url, description: strip(j.description || ""),
         posted_at: j.created || null, pay });
     }
     if (res.length < 50) break;
   }
   return out;
 }
+// ---- Remote job boards (public APIs, no keys). Pre-filtered to tech titles.
+async function fromRemotive(_slug: string): Promise<Raw[]> {
+  const d = await getJSON("https://remotive.com/api/remote-jobs"); // Remotive asks for <= 4 calls/day: source runs daily
+  return (d.jobs || []).filter((j: any) => laneOf(j.title || "")).map((j: any) => {
+    const desc = strip(j.description || "");
+    return { external_id: String(j.id), company: j.company_name || "Unknown", title: j.title, location: `Remote (${j.candidate_required_location || "Anywhere"})`,
+      url: j.url, description: desc, posted_at: j.publication_date ? new Date(j.publication_date).toISOString() : null, pay: findPay(j.salary || "") || findPay(desc) };
+  });
+}
+async function fromHimalayas(slug: string): Promise<Raw[]> {
+  const out = new Map<string, Raw>();
+  for (const q of slug.split(";")) {
+    const d = await getJSON(`https://himalayas.app/jobs/api/search?q=${encodeURIComponent(q)}&country=US`);
+    for (const j of d.jobs || []) {
+      if (!laneOf(j.title || "")) continue;
+      const desc = strip(j.description || j.excerpt || "");
+      const pay = j.minSalary && (j.currency || "USD") === "USD" ? fmtPay(+j.minSalary, +(j.maxSalary || j.minSalary), "") : findPay(desc);
+      const loc = (j.locationRestrictions || []).map((l: any) => (typeof l === "string" ? l : l?.name)).filter(Boolean).join("; ");
+      const id = String(j.guid || j.applicationLink);
+      out.set(id, { external_id: id, company: j.companyName || "Unknown", title: j.title, location: `Remote (${loc || "Anywhere"})`,
+        url: j.applicationLink || j.guid, description: desc, posted_at: j.pubDate ? new Date(+j.pubDate > 1e12 ? +j.pubDate : +j.pubDate * 1000).toISOString() : null,
+        pay, closes_at: j.expiryDate ? new Date(+j.expiryDate > 1e12 ? +j.expiryDate : +j.expiryDate * 1000).toISOString() : null });
+    }
+  }
+  return [...out.values()];
+}
+async function fromJobicy(slug: string): Promise<Raw[]> {
+  const d = await getJSON(`https://jobicy.com/api/v2/remote-jobs?count=100&geo=${encodeURIComponent(slug || "usa")}`);
+  return (d.jobs || []).filter((j: any) => laneOf(j.jobTitle || "")).map((j: any) => {
+    const desc = strip(j.jobDescription || j.jobExcerpt || "");
+    const pay = j.annualSalaryMin && (j.salaryCurrency || "USD") === "USD" ? fmtPay(+j.annualSalaryMin, +(j.annualSalaryMax || j.annualSalaryMin), "yr") : findPay(desc);
+    return { external_id: String(j.id), company: j.companyName || "Unknown", title: strip(j.jobTitle), location: `Remote (${j.jobGeo || "USA"})`,
+      url: j.url, description: desc, posted_at: j.pubDate ? new Date(j.pubDate).toISOString() : null, pay };
+  });
+}
+async function fromRemoteOK(_slug: string): Promise<Raw[]> {
+  const d = await getJSON("https://remoteok.com/api");
+  return (Array.isArray(d) ? d : []).filter((j: any) => j.id && j.position && laneOf(j.position)).map((j: any) => {
+    const desc = strip(j.description || "");
+    return { external_id: String(j.id), company: j.company || "Unknown", title: j.position, location: `Remote (${j.location || "Anywhere"})`,
+      url: j.url || j.apply_url, description: desc, posted_at: j.date || null,
+      pay: j.salary_min ? fmtPay(+j.salary_min, +(j.salary_max || j.salary_min), "yr") : findPay(desc) };
+  });
+}
 const ADAPTERS: Record<string, (slug: string, company: string) => Promise<Raw[]>> = {
   greenhouse: fromGreenhouse, lever: fromLever, ashby: fromAshby, amazon: fromAmazon,
   workday: fromWorkday, oracle: fromOracle, microsoft: fromMicrosoft, usajobs: fromUSAJobs, adzuna: fromAdzuna,
+  remotive: fromRemotive, himalayas: fromHimalayas, jobicy: fromJobicy, remoteok: fromRemoteOK,
 };
 // Keyword-search sources can't prove a job closed by its absence; verify() checks those by URL.
-const PARTIAL = new Set(["amazon", "workday", "oracle", "microsoft", "adzuna"]);
-// Region sources (e.g. Anchorage) accept any field, not just tech lanes.
-const AK_RE = /(anchorage|eagle river|chugiak|girdwood|\bjber\b|elmendorf|fort richardson|wasilla|palmer|\balaska\b|,\s*AK\b)/i;
+const PARTIAL = new Set(["amazon", "workday", "oracle", "microsoft", "adzuna", "himalayas", "jobicy"]);
+const REMOTE_BOARDS = new Set(["remotive", "himalayas", "jobicy", "remoteok"]);
+const AK_RE = /(anchorage|eagle river|chugiak|girdwood|\bjber\b|elmendorf|fort richardson|wasilla|palmer|\balaska\b|,\s*AK\b|north slope|prudhoe|deadhorse|kuparuk|kenai|nikiski|soldotna|valdez)/i;
+// Anchorage: only practical work Sultan can do — tech (laneOf), oil & gas / field, and skilled labor / operations.
+const AK_OIL = /(\boil\b|\bgas\b|pipeline|petroleum|refiner|\blng\b|north slope|prudhoe|roustabout|roughneck|floorhand|derrick|driller|drilling|well ?(test|service|site)|wellhead|\bfrac\b|production (operator|technician)|process (operator|technician)|plant operator|field (technician|tech|operator|service|specialist|engineer)|instrument(ation)? (tech|technician)|\bi&e\b|compressor)/i;
+const AK_LABOR = /(operator|equipment|crane|forklift|warehouse|material(s)? (handler|coordinator|specialist)|logistics|inventory|supply (tech|technician|specialist)|maintenance|mechanic|diesel|laborer|general labor|technician|\btech\b|telecom|inspector|safety (tech|technician|specialist|coordinator|officer|advisor)|\bhse\b|\behs\b|security (officer|guard|specialist)|corrections? officer|correctional|detention|dispatcher|utility (worker|tech|technician|operator)|facilities|production (worker|associate)|quality (tech|technician|inspector))/i;
+const AK_SKIP = /(\bsenior\b|\bsr\.?\s|\blead\b|manager|supervisor|superintendent|licensed|cardio|electrophysiolog|\bpart?ner\b|\bai\b)/i;
+const akLane = (t: string) => AK_SKIP.test(t) ? null : AK_OIL.test(t) ? "Oil & Gas / Field" : AK_LABOR.test(t) ? "Skilled labor / Ops" : null;
+// Obvious work-from-home scams / junk.
+const SCAM = /(data entry|commission[- ]only|\bmlm\b|be your own boss|unlimited (earning|income)|mystery shopper|reship|package (handler|forward)|crypto trading|forex|paid (surveys|daily)|no experience.{0,30}\$\d{3,})/i;
+const REMOTE_T = /\b(remote|work from home|wfh|telework|teleworking|virtual)\b/i;
+function workMode(r: Raw, src: any): string {
+  const head = `${r.title} ${r.location}`, desc = (r.description || "").slice(0, 4000);
+  if (/remote hands/i.test(head)) return "onsite";
+  if (/hybrid/i.test(head)) return "hybrid";
+  if (REMOTE_T.test(head) || REMOTE_BOARDS.has(src.kind)) return /\bhybrid\b/i.test(desc) && !REMOTE_BOARDS.has(src.kind) ? "hybrid" : "remote";
+  if (/(hybrid (work|schedule|role|position|model|environment)|\d days? (a|per) week (in|on)[- ](the )?(office|site)|this (role|position) is hybrid)/i.test(desc)) return "hybrid";
+  if (/((fully|100%) remote|remote[- ](first|position|role|job|opportunity|eligible)|work (from|at) home)/i.test(desc)) return "remote";
+  return "onsite";
+}
+const US_OK = /\b(US|USA|U\.S\.|United States|Americas|North America|worldwide|anywhere)\b/i;
 const EXEC = /\b(director|vice president|\bvp\b|chief|president|head of|principal|partner|supervisory)\b/i;
-const LICENSED = /(physician|surgeon|surgical|dentist|dental|hygien|pharmac|nurs(e|ing)\b|\brn\b|\blpn\b|\bcna\b|attorney|lawyer|counsel|psycholog|therap|social worker|teacher|professor|\bpilot\b|first officer|captain|veterinar|optometr|audiolog|rehab|radiolog|sonograph|technologist|\bmri\b|\bct\b|cath lab|x-?ray|paramedic|\bemt\b|anesthes|midwife|physician assistant|\bnp\b|pa-c|behavioral health|mental health|clinical|clinician|phlebotom|respiratory|dietitian|speech|hospitalist|(civil|structural|geotechnical|hydraulic|environmental|electrical|mechanical) engineer|\(hydraulics\)|accountant|\bcpa\b|actuar|surg tech|cvor|allied health)/i;
+const LICENSED = /(physician|surgeon|surgical|dentist|dental|hygien|pharmac|nurs(e|ing)\b|\brn\b|\blpn\b|\bcna\b|attorney|lawyer|counsel|psycholog|therap|social worker|teacher|professor|\bpilot\b|first officer|captain|veterinar|optometr|audiolog|rehab|radiolog|sonograph|technologist|\bmri\b|\bct\b|cath lab|x-?ray|paramedic|\bemt\b|anesthes|midwife|physician assistant|\bnp\b|pa-c|behavioral health|mental health|clinical|clinician|phlebotom|respiratory|dietitian|speech|hospitalist|(civil|structural|geotechnical|hydraulic|environmental|electrical|mechanical) engineer|\(hydraulics\)|accountant|\bcpa\b|actuar|surg tech|cvor|allied health|medical|patient|clinic|hospital|laborator|ophthalm|electrician|plumber|line ?(man|worker)|\ba&p\b|airframe|avionics|aircraft (mechanic|technician|maintenance)|\bcdl\b|truck driver|chef|cook\b|teller|rad tech|\bep (tech|lab)|\beeg\b|\bekg\b|\becg\b|echo tech|\bcvt\b|allied|social work|dietic|sterile|\bspd\b|lab tech|pharm tech|ultrasound|mammo|dialysis|per week|travel .{0,25}tech|caregiver|\bdsp\b|direct support|home health|veterinary|groomer)/i;
+// Healthcare employers: only their IT/tech-lane roles count.
+const HEALTH_CO = /(medical|health|hospital|clinic|staffing|healthcare|providence|nursing|care (center|services))/i;
+// Non-English postings (Latin America boards).
+const FOREIGN_T = /(atendente|analista|soporte|suporte|t[eé]cnico|desarroll|vaga|empleo)/i;
 
 // ---------- relevance + fit scoring (Sultan's verified profile) ----------
-const SENIOR = /\b(senior|sr\.?|staff|principal|lead|manager|director|head|chief|architect|vp|president|iii|iv|v\b|intern|internship|counsel|recruiter|sales|account|construction|project|program|security|electrical|mechanical|controls|commissioning|facilit(y|ies)|civil|design|planner|procurement|logistics|finance|legal|marketing|quality|software|developer|sde|early access|forward[- ]deployed|supervisor|scientist|researcher|machine learning|ml)\b/i;
+const SENIOR = /\b(senior|sr\.?|mgr|staff|principal|lead|manager|director|head|chief|architect|vp|president|iii|iv|v\b|intern|internship|counsel|recruiter|sales|account|construction|project|program|security|electrical|mechanical|controls|commissioning|facilit(y|ies)|civil|design|planner|procurement|logistics|finance|legal|marketing|quality|software|developer|sde|early access|forward[- ]deployed|supervisor|scientist|researcher|machine learning|ml)\b/i;
 function laneOf(title: string): string | null {
   if (SENIOR.test(title)) return null;
   if (/servicenow/i.test(title)) return "ServiceNow";
@@ -253,7 +324,7 @@ function laneOf(title: string): string | null {
       && /(tech|operations|specialist|associate|engineer|deployment|integrat)/i.test(title)) return "Data Center";
   if (/(\bnpi\b|new product introduction|manufacturing engineer|process engineer|product engineer|production engineer|test engineer|rack integration|(system|systems|hardware|server|rack) (integration|validation|test|operations|reliability|bring[- ]?up) engineer|hardware engineering technician|failure analysis)/i.test(title)
       && !/(chemical|petroleum|refin|pipeline|drilling|subsea|reservoir|pharma|biolog|food|civil|structural|\btpm\b|motors?|actuators?|propulsion|aerospace|space|thermo|mechatronic|dynamics|robotic|battery|vehicle|wafer|\bai\b)/i.test(title)) return "Hardware / NPI";
-  if (/(it support|help ?desk|service desk|desktop support|end[- ]user support|it technician|it specialist|it operations (tech|specialist|analyst)|technical support (specialist|analyst|technician)|support technician|it analyst)/i.test(title)) return "IT Support";
+  if (/(it support|help ?desk|service desk|desktop support|end[- ]user support|it technician|it specialist|it operations (tech|specialist|analyst)|technical support (specialist|analyst|technician|engineer)|support technician|it analyst|\bnoc (technician|analyst|engineer|specialist)|network operations center|application support (analyst|specialist|engineer)|product support (specialist|engineer)|it helpdesk)/i.test(title)) return "IT Support";
   if (/(systems? administrator|sysadmin|linux administrator|infrastructure administrator|systems? technician|network (administrator|technician|specialist)|it administrator|telecom(munications)? technician)/i.test(title)) return "Sysadmin";
   return null;
 }
@@ -297,7 +368,7 @@ const LACK: [string, RegExp][] = [
   ["Trade license (journeyman)", /(journeyman|licensed (electrician|plumber|welder)|apprenticeship completion)/i],
 ];
 const CLEARANCE = /(active (secret|ts|top secret)|(secret|ts\/sci|top secret|public trust) clearance|clearance (is )?required|must (hold|possess) .{0,20}clearance)/i;
-const MY_YEARS: Record<string, number> = { "Data Center": 4, "Hardware / NPI": 1, "IT Support": 4, "Sysadmin": 1, "ServiceNow": 0, "Anchorage – other fields": 4 };
+const MY_YEARS: Record<string, number> = { "Data Center": 4, "Hardware / NPI": 1, "IT Support": 4, "Sysadmin": 1, "ServiceNow": 0, "Oil & Gas / Field": 2, "Skilled labor / Ops": 4 };
 
 function yearsRequired(desc: string): number | null {
   const req = desc.match(/(minimum|basic|required|requirements|qualifications|what you'll need|you have|must have)[\s\S]{0,2500}/i)?.[0] || desc;
@@ -316,7 +387,7 @@ function score(r: Raw, lane: string) {
   const snow = /servicenow/i.test(text);
   const gaps = LACK.filter(([k, re]) => (snow || !/^ServiceNow/.test(k)) && re.test(text)).map(([k]) => k);
   const yrs = yearsRequired(r.description);
-  let s = ({ "Data Center": 58, "Hardware / NPI": 54, "IT Support": 48, "Sysadmin": 38, "ServiceNow": 32, "Anchorage – other fields": 46 } as Record<string, number>)[lane] ?? 46;
+  let s = ({ "Data Center": 58, "Hardware / NPI": 54, "IT Support": 48, "Sysadmin": 38, "ServiceNow": 32, "Oil & Gas / Field": 50, "Skilled labor / Ops": 50 } as Record<string, number>)[lane] ?? 46;
   if (lane === "ServiceNow" && /(junior|jr\.?|associate|entry|early career|graduate|trainee|apprentice)/i.test(r.title + " " + r.description.slice(0, 600))) s += 22;
   if (/\btechnician\b/i.test(r.title) && lane === "Data Center") s += 4;
   s += Math.min(matched.length * 4, 32);
@@ -345,18 +416,26 @@ async function ingest(onlySource?: number) {
       const seen = new Set<string>(); const rows: any[] = [];
       for (const r of raws) {
         let lane = laneOf(r.title);
-        if (src.region === "anchorage") {
-          if (!AK_RE.test(r.location) || EXEC.test(r.title) || LICENSED.test(r.title) || /clearance/i.test(r.title) || !/[a-z]{3}/i.test(r.title)) continue;
+        const mode = workMode(r, src);
+        if (src.region) {
+          if (SCAM.test(`${r.title}\n${(r.description || "").slice(0, 2000)}`) || EXEC.test(r.title) || /clearance/i.test(r.title) || !/[a-z]{3}/i.test(r.title)) continue;
           if (r.closes_at && new Date(r.closes_at) < new Date()) continue;
-          lane = lane || "Anchorage – other fields";
         }
-        if (!lane || !r.url || (src.region !== "anchorage" && !isUS(r.location))) continue;
+        if (src.region === "anchorage") {
+          if (!AK_RE.test(r.location) || LICENSED.test(r.title)) continue;
+          lane = lane || (HEALTH_CO.test(r.company) ? null : akLane(r.title));
+        } else if (src.region === "remote") {
+          if (mode === "onsite" || FOREIGN_T.test(r.title)) continue;
+          if (mode === "remote" && (NON_US.test(r.location) || /(europe|emea|latam|latin america|apac|asia|africa|philippines|pakistan|nigeria|argentina|colombia)/i.test(r.location)) && !US_OK.test(r.location)) continue;
+          if (mode === "hybrid" && !isUS(r.location)) continue;
+        } else if (!isUS(r.location)) continue;
+        if (!lane || !r.url) continue;
         const sc = score(r, lane); if (!sc) continue;
         if (seen.has(r.external_id)) continue;
         seen.add(r.external_id);
         const row: any = { source_id: src.id, external_id: r.external_id, company: r.company, title: r.title, location: r.location,
           url: r.url, lane, pay: r.pay, description: r.description, posted_at: r.posted_at, last_seen_at: new Date().toISOString(),
-          is_open: true, closed_at: null, close_reason: null, ...sc, ...payYears(r.pay) };
+          is_open: true, closed_at: null, close_reason: null, work_mode: mode, ...sc, ...payYears(r.pay) };
         if (!known.has(r.external_id)) newCount++;
         rows.push(row);
       }
@@ -373,7 +452,7 @@ async function ingest(onlySource?: number) {
         }
       }
       // Aggregator listings that haven't appeared for 3 days are treated as closed.
-      if (src.kind === "adzuna" && raws.length > 0) {
+      if ((src.kind === "adzuna" || src.kind === "himalayas" || src.kind === "jobicy") && raws.length > 0) {
         const stale = new Date(Date.now() - 72 * 3600e3).toISOString();
         const { data: old } = await sb.from("postings").update({ is_open: false, closed_at: new Date().toISOString(), close_reason: "No longer listed" })
           .eq("source_id", src.id).eq("is_open", true).lt("last_seen_at", stale).select("id");
